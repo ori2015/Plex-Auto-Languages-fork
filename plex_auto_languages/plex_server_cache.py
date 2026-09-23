@@ -502,7 +502,8 @@ class PlexServerCache:
             # `added` and be retained for a result the caller throws away.
             collect_changes = bool(previous_parts)
             # Items missing from the snapshot count as added only when Plex added
-            # them since that refresh (with an hour of slack for clock skew).
+            # them since that refresh (with an hour of slack for clock skew); an
+            # item without addedAt cannot be shown to be new.
             # Anything older was never tracked, e.g. a library section that just
             # became covered, and processing it would override every user's
             # existing choices across that whole section.
@@ -536,7 +537,7 @@ class PlexServerCache:
                         changed.append(episode.key)
                     continue
                 added_at = getattr(episode, "addedAt", None)
-                if added_at is not None and added_at < added_since:
+                if added_at is None or added_at < added_since:
                     continue
 
                 # Record only what the consumers read. Retaining the Episode

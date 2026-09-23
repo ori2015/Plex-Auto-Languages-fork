@@ -9,7 +9,7 @@ from tests.fakes import FakeEpisode, FakeMedia, FakePart
 
 
 def _episode(key, part_keys):
-    episode = FakeEpisode(key=key)
+    episode = FakeEpisode(key=key, added_at=datetime.now())
     episode.media = [FakeMedia([FakePart(key=k) for k in part_keys])]
     return episode
 

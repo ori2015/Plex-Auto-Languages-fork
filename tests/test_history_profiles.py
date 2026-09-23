@@ -232,7 +232,8 @@ def test_refresh_does_not_report_long_existing_items_as_added():
     # but was not added since the last refresh, so it is a baseline, not "added".
     old = FakeMovie(key="/library/metadata/10", added_at=datetime(2026, 1, 1))
     new = FakeMovie(key="/library/metadata/11", added_at=datetime(2026, 9, 23, 12, 30))
-    cache = _cache({"/library/metadata/1": ["/part/a"]}, [old, new])
+    undated = FakeMovie(key="/library/metadata/12", added_at=None)
+    cache = _cache({"/library/metadata/1": ["/part/a"]}, [old, new, undated])
     cache._last_refresh = datetime(2026, 9, 23, 12, 0)
 
     added = cache.refresh_library_cache()
