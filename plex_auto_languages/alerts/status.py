@@ -53,9 +53,11 @@ class PlexStatus(PlexAlert):
         This method handles library scan completion events by:
         1. Refreshing the library cache or fetching recently added episodes
         2. Processing newly added episodes for all users
-        3. Processing updated episodes for all users
-        4. Applying appropriate track selection based on user preferences
-        5. Skipping items from ignored libraries
+        3. Applying appropriate track selection based on user preferences
+        4. Skipping items from ignored libraries
+
+        Episodes whose media changed are not processed here: the refresh starts
+        them settling, and PlexServer.process_settled_episodes() handles them.
 
         Args:
             plex (PlexServer): The Plex server instance to interact with.
@@ -69,14 +71,12 @@ class PlexStatus(PlexAlert):
 
         if plex.config.get("refresh_library_on_scan"):
             if datetime.now() - plex.cache.last_refresh > SCAN_REFRESH_COOLDOWN:
-                added, updated = plex.cache.refresh_library_cache()
+                added = plex.cache.refresh_library_cache()
             else:
                 logger.debug("[Status] Library cache refreshed recently; using recently-added query")
                 added = plex.get_recently_added_episode_refs(minutes=5)
-                updated = []
         else:
             added = plex.get_recently_added_episode_refs(minutes=5)
-            updated = []
 
         # Scoped to this handler call so it cannot serve stale labels later.
         show_memo: dict = {}
@@ -103,25 +103,3 @@ class PlexStatus(PlexAlert):
                 # Change tracks for all users
                 logger.info(f"[Status] Processing newly added episode {name}")
                 plex.process_new_or_updated_episode(ref.key, EventType.NEW_EPISODE, True, reference_memo)
-
-        # Process updated episodes
-        if len(updated) > 0:
-            logger.debug(f"[Status] Found {len(updated)} updated episode(s)")
-            for ref in updated:
-                name = plex.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
-                # Check if the library should be ignored
-                if plex.should_ignore_library(ref.library_section_title):
-                    logger.debug(f"[Status] Ignoring episode {name} due to ignored library: '{ref.library_section_title}'")
-                    continue
-
-                # Check if the item should be ignored
-                if plex.should_ignore_show_by_key(ref.show_key, show_memo):
-                    continue
-
-                # Check if the item has already been processed
-                if not plex.cache.should_process_recently_updated(ref.key):
-                    continue
-
-                # Change tracks for all users
-                logger.info(f"[Status] Processing updated episode {name}")
-                plex.process_new_or_updated_episode(ref.key, EventType.UPDATED_EPISODE, False, reference_memo)

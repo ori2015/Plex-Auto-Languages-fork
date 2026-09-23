@@ -19,23 +19,40 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
-def part_identity(part_key: str) -> str:
+def _split_part_key(part_key: str) -> tuple[str, str | None]:
     """
-    Strip the file modification time from a Plex media part key.
+    Split a Plex media part key into (identity, mtime).
 
-    Plex part keys look like /library/parts/<id>/<mtime>/file.<ext>. The mtime
-    segment changes whenever the file is written to, e.g. while a torrent client
-    is still downloading into the library, so comparing raw keys reports the
-    episode as updated on every scan. A genuinely replaced file (e.g. a Sonarr
-    upgrade) gets a new part id, so the id and extension are enough to detect it.
-
-    Keys that do not match that shape are returned unchanged, which also makes
-    the function idempotent.
+    Plex part keys look like /library/parts/<id>/<mtime>/file.<ext>. The id and
+    extension identify the file; the mtime moves whenever the file is written to.
+    Keys without an mtime segment (older caches of this fork stored them stripped)
+    return mtime None.
     """
     segments = part_key.split("/")
     if len(segments) == 6 and segments[1:3] == ["library", "parts"] and segments[4].isdigit():
-        del segments[4]
-    return "/".join(segments)
+        mtime = segments.pop(4)
+        return "/".join(segments), mtime
+    return part_key, None
+
+
+def parts_changed(previous: list, current: list) -> bool:
+    """
+    Whether an episode's media changed between two lists of part keys.
+
+    True when a part was added, removed or replaced (new part id), or when a part
+    kept its id but its file was written to (new mtime). An mtime that is unknown
+    on either side is not a change.
+    """
+    previous_mtimes = dict(_split_part_key(key) for key in previous)
+    current_mtimes = dict(_split_part_key(key) for key in current)
+    if previous_mtimes.keys() != current_mtimes.keys():
+        return True
+    return any(
+        previous_mtimes[identity] is not None
+        and current_mtimes[identity] is not None
+        and previous_mtimes[identity] != current_mtimes[identity]
+        for identity in current_mtimes
+    )
 
 
 class PlexServerCache:
@@ -55,12 +72,12 @@ class PlexServerCache:
         default_streams (dict): Maps item keys to default audio and subtitle stream IDs.
         user_clients (dict): Maps client identifiers to user IDs.
         newly_added (dict): Maps episode IDs to their added timestamps.
-        newly_updated (dict): Maps episode IDs to their updated timestamps.
+        settling (dict): Maps episode keys whose media changed to when the last change was seen.
         recent_activities (dict): Maps (user_id, item_id) tuples to activity timestamps.
         _instance_users (list): List of users with access to the Plex server.
         _instance_user_tokens (dict): Maps user IDs to their authentication tokens.
         _instance_users_valid_until (datetime): Expiration timestamp for cached user data.
-        episode_parts (dict): Maps episode keys to their media part identities (see part_identity).
+        episode_parts (dict): Maps episode keys to their raw media part keys.
         _legacy_cache_file_path (str): Legacy JSON cache path used for one-time migration.
         _db_path (str): Path to the SQLite cache database file.
         _cache_file_path (str): Backwards-compatible alias for cache storage path usage.
@@ -90,7 +107,6 @@ class PlexServerCache:
         self.default_streams = {}    # item_key: (audio_stream_id, substitle_stream_id)
         self.user_clients = {}       # client_identifier: user_id
         self.newly_added = {}        # episode_id: added_at
-        self.newly_updated = {}      # episode_id: updated_at
         self.recent_activities = {}  # (user_id, item_id): timestamp
 
         # Users cache (in-memory only)
@@ -100,6 +116,7 @@ class PlexServerCache:
 
         # Library cache (persisted in SQLite)
         self.episode_parts = {}
+        self.settling = {}           # episode_key: when its media last changed
 
         self._legacy_cache_file_path, self._db_path = self._get_cache_paths()
         self._cache_file_path = self._db_path  # backwards-compatible internal attribute usage
@@ -183,10 +200,16 @@ class PlexServerCache:
                     episode_key TEXT PRIMARY KEY,
                     newly_added_at TEXT NULL,
                     newly_updated_at TEXT NULL,
-                    part_keys_json TEXT NOT NULL DEFAULT '[]'
+                    part_keys_json TEXT NOT NULL DEFAULT '[]',
+                    settling_since TEXT NULL
                 );
                 """
             )
+            # newly_updated_at is no longer used; it stays in the schema so the
+            # upstream image can still read this database after a rollback.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
+            if "settling_since" not in columns:
+                conn.execute("ALTER TABLE episodes ADD COLUMN settling_since TEXT NULL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS system_metadata (
@@ -240,7 +263,7 @@ class PlexServerCache:
         try:
             with self._connect() as conn:
                 episode_rows = conn.execute(
-                    "SELECT episode_key, newly_added_at, newly_updated_at, part_keys_json FROM episodes"
+                    "SELECT episode_key, newly_added_at, part_keys_json, settling_since FROM episodes"
                 ).fetchall()
                 last_refresh_row = conn.execute(
                     "SELECT value FROM system_metadata WHERE key = ?",
@@ -256,10 +279,10 @@ class PlexServerCache:
             return False
 
         self.newly_added = {}
-        self.newly_updated = {}
+        self.settling = {}
         self.episode_parts = {}
 
-        for episode_key, newly_added_at, newly_updated_at, part_keys_json in episode_rows:
+        for episode_key, newly_added_at, part_keys_json, settling_since in episode_rows:
             try:
                 part_keys = json.loads(part_keys_json) if part_keys_json else []
                 if not isinstance(part_keys, list):
@@ -267,17 +290,15 @@ class PlexServerCache:
             except json.JSONDecodeError:
                 part_keys = []
 
-            # Normalizing here keeps caches written by older versions, which
-            # stored raw keys, from reporting the whole library as updated.
-            self.episode_parts[episode_key] = [part_identity(key) for key in part_keys]
+            self.episode_parts[episode_key] = part_keys
 
             parsed_added_at = self._parse_datetime(newly_added_at)
             if parsed_added_at is not None:
                 self.newly_added[episode_key] = parsed_added_at
 
-            parsed_updated_at = self._parse_datetime(newly_updated_at)
-            if parsed_updated_at is not None:
-                self.newly_updated[episode_key] = parsed_updated_at
+            parsed_settling_since = self._parse_datetime(settling_since)
+            if parsed_settling_since is not None:
+                self.settling[episode_key] = parsed_settling_since
 
         self._last_refresh = datetime.fromtimestamp(0)
         if last_refresh_row and last_refresh_row[0]:
@@ -321,14 +342,6 @@ class PlexServerCache:
             logger.error(f"[Cache] Failed to read legacy cache file at {self._legacy_cache_file_path}: {e}")
             return False
 
-        self.newly_updated = {}
-        raw_newly_updated = cache.get("newly_updated", {})
-        if isinstance(raw_newly_updated, dict):
-            for key, value in raw_newly_updated.items():
-                parsed_value = self._parse_datetime(value)
-                if parsed_value is not None:
-                    self.newly_updated[key] = parsed_value
-
         self.newly_added = {}
         raw_newly_added = cache.get("newly_added", {})
         if isinstance(raw_newly_added, dict):
@@ -341,7 +354,7 @@ class PlexServerCache:
         self.episode_parts = {}
         if isinstance(raw_episode_parts, dict):
             for key, value in raw_episode_parts.items():
-                self.episode_parts[key] = [part_identity(k) for k in value] if isinstance(value, list) else []
+                self.episode_parts[key] = value if isinstance(value, list) else []
 
         self._last_refresh = self._parse_datetime(cache.get("last_refresh"), datetime.fromtimestamp(0)) or datetime.fromtimestamp(0)
 
@@ -383,96 +396,107 @@ class PlexServerCache:
             self.newly_added[episode_id] = added_at
             return True
 
-    def should_process_recently_updated(self, episode_id: str) -> bool:
+    def note_episode_parts(self, episode) -> bool:
         """
-        Determines if a recently updated episode should be processed.
+        Record an episode's current media parts and start settling it if they changed.
 
-        Checks if the episode has already been processed since the last library refresh.
-        If not, records the episode as processed and returns True.
-
-        Args:
-            episode_id (str): The Plex key identifier for the episode.
-
-        Returns:
-            bool: True if the episode should be processed, False if it was already processed.
-        """
-        with self._lock:
-            if episode_id in self.newly_updated and self.newly_updated[episode_id] >= self._last_refresh:
-                return False
-            self.newly_updated[episode_id] = datetime.now()
-            return True
-
-    def did_episode_parts_change(self, episode) -> bool:
-        """
-        Check if an episode's media parts have changed since last check.
-
-        Uses the existing episode_parts cache to detect file changes.
-        This is used to determine if a metadataState event represents
-        a real file upgrade (e.g., Sonarr) or just metadata refresh.
+        A changed episode is not processed right away: a file still being written into
+        the library changes on every Plex re-analysis, and processing each of those
+        re-ran every user's track selection dozens of times. Instead the change (re)starts
+        the episode's settling clock, and settle() releases it once the media stops
+        changing.
 
         Args:
             episode: The episode to check.
 
         Returns:
-            bool: True if parts changed, False otherwise.
+            bool: True if the parts changed, False otherwise.
         """
         with self._lock:
-            current_parts = []
-            for part in episode.iterParts():
-                if part.key:
-                    current_parts.append(part_identity(part.key))
+            changed = self._record_episode_parts(episode)
+        if changed:
+            self.save()
+        return changed
 
-            previous_parts = self.episode_parts.get(episode.key)
-            self.episode_parts[episode.key] = current_parts
-            parts_changed = previous_parts is not None and set(current_parts) != set(previous_parts)
-            if parts_changed:
-                self.save()
+    def _record_episode_parts(self, episode) -> bool:
+        """note_episode_parts() without saving; the caller must hold the lock."""
+        current_parts = [part.key for part in episode.iterParts() if part.key]
+        previous_parts = self.episode_parts.get(episode.key)
+        self.episode_parts[episode.key] = current_parts
+        if not previous_parts or not parts_changed(previous_parts, current_parts):
+            return False
+        self.settling[episode.key] = datetime.now()
+        return True
 
-            if not previous_parts:
-                return False
+    def settled_episode_keys(self, quiet_period: timedelta) -> list[str]:
+        """Keys of settling episodes whose media has not changed for quiet_period."""
+        threshold = datetime.now() - quiet_period
+        with self._lock:
+            return [key for key, since in self.settling.items() if since <= threshold]
 
-            return set(current_parts) != set(previous_parts)
+    def settle(self, episode) -> bool:
+        """
+        Release a settling episode for processing if its media is still unchanged.
+
+        Args:
+            episode: The freshly fetched episode.
+
+        Returns:
+            bool: True if the episode stopped settling and should be processed; False if
+                its media changed again, which restarts its settling clock.
+        """
+        with self._lock:
+            changed = self._record_episode_parts(episode)
+            if not changed:
+                self.settling.pop(episode.key, None)
+        self.save()
+        return not changed
+
+    def forget_settling(self, episode_key: str) -> None:
+        """Stop settling an episode without processing it (e.g. it was deleted)."""
+        with self._lock:
+            self.settling.pop(episode_key, None)
+        self.save()
 
     @property
     def last_refresh(self) -> datetime:
         """When the full library cache was last refreshed (epoch if never)."""
         return self._last_refresh
 
-    def refresh_library_cache(self) -> tuple[list, list]:
+    def refresh_library_cache(self) -> list:
         """
         Refreshes the cached library data by scanning all episodes in the Plex library.
 
         Updates the episode_parts dictionary with current data from the Plex server.
-        Identifies episodes that have been added or updated since the last refresh.
+        Returns episodes added since the last refresh; episodes whose media changed
+        start settling (see note_episode_parts) instead of being returned.
 
         The network-bound iteration deliberately runs OUTSIDE the cache lock: it
         takes minutes on a large library, and holding the RLock across it froze
         every consumer touching the cache (should_process_recently_*, 
-        did_episode_parts_change) for the whole run, which let the bounded alert
+        note_episode_parts) for the whole run, which let the bounded alert
         queue fill and drop alerts whenever scans arrived back-to-back. The diff
         runs against a snapshot taken under the lock, so concurrent in-place
-        updates from did_episode_parts_change cannot skew it.
+        updates from note_episode_parts cannot skew it.
 
         On a cold cache there is nothing to diff against, so no changes are collected
-        and both returned lists are empty. The only caller in that situation discards
+        and the returned list is empty. The only caller in that situation discards
         the return value anyway, and collecting would mean retaining every Episode in
         the library to report the whole thing as "added".
 
         Returns:
-            tuple[list[EpisodeRef], list[EpisodeRef]]: A tuple containing two lists:
-                - Refs for newly added episodes
-                - Refs for updated episodes
+            list[EpisodeRef]: Refs for newly added episodes.
         """
         with self._lock:
             if self._is_refreshing:
                 logger.debug("[Cache] The library cache is already being refreshed")
-                return [], []
+                return []
 
             self._is_refreshing = True
             # Snapshot the parts cache for the diff below. The whole iteration
-            # runs lock-free, so the snapshot is what the added/updated
+            # runs lock-free, so the snapshot is what the added/changed
             # decisions compare against - not the live dict, which a concurrent
-            # did_episode_parts_change() may mutate mid-refresh.
+            # note_episode_parts() may mutate mid-refresh.
             previous_parts = dict(self.episode_parts)
             # A cold cache diffs against nothing, so every episode would land in
             # `added` and be retained for a result the caller throws away.
@@ -484,7 +508,7 @@ class PlexServerCache:
         try:
             logger.debug("[Cache] Refreshing library cache")
             added = []
-            updated = []
+            changed = []
             new_episode_parts = {}
 
             # Iterate lazily: holding the whole library at once costs >1GB on
@@ -494,24 +518,22 @@ class PlexServerCache:
                 part_list = new_episode_parts.setdefault(episode.key, [])
                 files = []
                 for part in episode.iterParts():
-                    part_list.append(part_identity(part.key))
+                    part_list.append(part.key)
                     if collect_files and getattr(part, "file", None):
                         files.append(part.file)
 
                 if not collect_changes:
                     continue
 
-                if episode.key in previous_parts and set(previous_parts[episode.key]) != set(part_list):
-                    target = updated
-                elif episode.key not in previous_parts:
-                    target = added
-                else:
+                if episode.key in previous_parts:
+                    if previous_parts[episode.key] and parts_changed(previous_parts[episode.key], part_list):
+                        changed.append(episode.key)
                     continue
 
                 # Record only what the consumers read. Retaining the Episode
                 # costs ~12KB each, which is enough to OOM the process when a
-                # bulk change marks the whole library as updated.
-                target.append(EpisodeRef(
+                # bulk change adds a large part of the library.
+                added.append(EpisodeRef(
                     key=episode.key,
                     added_at=getattr(episode, "addedAt", None),
                     library_section_title=getattr(episode, "librarySectionTitle", None),
@@ -527,9 +549,13 @@ class PlexServerCache:
             with self._lock:
                 self.episode_parts = new_episode_parts
                 self._last_refresh = datetime.now()
+                for episode_key in changed:
+                    self.settling[episode_key] = self._last_refresh
+            if changed:
+                logger.debug(f"[Cache] Media changed for {len(changed)} episode(s); waiting for them to settle")
             logger.debug("[Cache] Done refreshing library cache")
             self.save(force=True)
-            return added, updated
+            return added
         finally:
             with self._lock:
                 self._is_refreshing = False
@@ -620,7 +646,7 @@ class PlexServerCache:
         try:
             while True:
                 with self._lock:
-                    episode_keys = set(self.episode_parts.keys()) | set(self.newly_added.keys()) | set(self.newly_updated.keys())
+                    episode_keys = set(self.episode_parts.keys()) | set(self.newly_added.keys()) | set(self.settling.keys())
                     episode_rows = []
                     for episode_key in episode_keys:
                         part_keys = self.episode_parts.get(episode_key, [])
@@ -631,8 +657,8 @@ class PlexServerCache:
                             (
                                 episode_key,
                                 self._datetime_to_str(self.newly_added.get(episode_key)),
-                                self._datetime_to_str(self.newly_updated.get(episode_key)),
                                 json.dumps(part_keys),
+                                self._datetime_to_str(self.settling.get(episode_key)),
                             )
                         )
 
@@ -646,7 +672,7 @@ class PlexServerCache:
                         for episode_row in episode_rows:
                             conn.execute(
                                 """
-                                INSERT INTO episodes (episode_key, newly_added_at, newly_updated_at, part_keys_json)
+                                INSERT INTO episodes (episode_key, newly_added_at, part_keys_json, settling_since)
                                 VALUES (?, ?, ?, ?)
                                 """,
                                 episode_row,
@@ -724,15 +750,11 @@ class PlexServerCache:
                     for key in keys_to_remove:
                         del self.default_streams[key]
 
-            # Clean newly_added and newly_updated (older than last refresh)
+            # Clean newly_added (older than last refresh)
             if self._last_refresh != datetime.fromtimestamp(0):
                 self.newly_added = {
                     episode_id: added_at for episode_id, added_at in self.newly_added.items()
                     if added_at > self._last_refresh
-                }
-                self.newly_updated = {
-                    episode_id: updated_at for episode_id, updated_at in self.newly_updated.items()
-                    if updated_at > self._last_refresh
                 }
 
             # Clean expired user caches

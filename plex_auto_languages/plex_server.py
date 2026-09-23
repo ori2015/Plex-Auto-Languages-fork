@@ -3,6 +3,7 @@ import requests
 import itertools
 import warnings
 import re
+import threading
 import concurrent.futures
 from urllib.parse import urlparse
 from typing import Union, Callable, Iterator, List, Tuple, Optional
@@ -35,6 +36,11 @@ logger = get_logger()
 # parallelized alert consumer, would otherwise churn thread creation constantly).
 _USER_FANOUT_POOL = concurrent.futures.ThreadPoolExecutor(
     max_workers=5, thread_name_prefix="user-fanout")
+
+# How long an episode's media must stay unchanged before it is processed as
+# updated. Long enough to outlast the gaps between Plex re-analyses of a file
+# that is still being downloaded into the library.
+SETTLE_QUIET_PERIOD = timedelta(minutes=10)
 
 
 class SelectiveVerifySession(requests.Session):
@@ -371,6 +377,7 @@ class PlexServer(UnprivilegedPlexServer):
         logger.info(f"Successfully connected as user '{self.username}' (id: {self.user_id})")
         self._alert_handler = None
         self._alert_listener = None
+        self._settle_lock = threading.Lock()
         self.cache = PlexServerCache(self)
 
     @property
@@ -806,6 +813,41 @@ class PlexServer(UnprivilegedPlexServer):
         track_changes._episode = None
         track_changes = None
 
+    def process_settled_episodes(self) -> None:
+        """
+        Process, once, every episode whose media changed and has since stopped changing.
+
+        Each candidate is fetched again to confirm its parts still match what was last
+        seen; if they moved, its settling clock restarts instead. Runs periodically
+        from the main loop; overlapping calls return immediately.
+        """
+        if not self._settle_lock.acquire(blocking=False):
+            return
+        try:
+            keys = self.cache.settled_episode_keys(SETTLE_QUIET_PERIOD)
+            show_memo: dict = {}
+            reference_memo: dict = {}
+            for key in keys:
+                item = self.fetch_item(key)
+                if item is None or not isinstance(item, Episode):
+                    self.cache.forget_settling(key)
+                    continue
+                if not self.cache.settle(item):
+                    continue
+                name = self.format_ref_name(item.grandparentTitle, item.parentIndex, item.index)
+                if self.should_ignore_library(item.librarySectionTitle):
+                    continue
+                if self.should_ignore_show_by_key(item.grandparentRatingKey, show_memo):
+                    continue
+                if self.should_ignore_filepath(item):
+                    continue
+                logger.info(f"[Settle] Processing updated episode {name}")
+                self.process_new_or_updated_episode(key, EventType.UPDATED_EPISODE, False, reference_memo)
+        except Exception as e:
+            logger.error(f"[Settle] Failed to process settled episodes: {e}")
+        finally:
+            self._settle_lock.release()
+
     def change_tracks(self, username: str, episode: Episode, event_type: EventType) -> None:
         """
         Change audio and subtitle tracks for an episode based on user preferences.
@@ -872,7 +914,7 @@ class PlexServer(UnprivilegedPlexServer):
                 self.change_tracks(user.name, episode, EventType.SCHEDULER)
 
         # Scan library
-        added, updated = self.cache.refresh_library_cache()
+        added = self.cache.refresh_library_cache()
         # Scoped to this loop so it cannot serve stale labels on a later run.
         show_memo: dict = {}
         reference_memo: dict = {}
@@ -888,18 +930,6 @@ class PlexServer(UnprivilegedPlexServer):
             name = self.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
             logger.info(f"[Scheduler] Processing newly added episode {name}")
             self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, True, reference_memo)
-        for ref in updated:
-            if self.should_ignore_library(ref.library_section_title):
-                continue
-            if self.should_ignore_show_by_key(ref.show_key, show_memo):
-                continue
-            if self._matches_ignore_filepattern(ref.part_files):
-                continue
-            if not self.cache.should_process_recently_updated(ref.key):
-                continue
-            name = self.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
-            logger.info(f"[Scheduler] Processing updated episode {name}")
-            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, False, reference_memo)
         logger.info("[Scheduler] Deep analysis completed")
 
     def stop(self) -> None:

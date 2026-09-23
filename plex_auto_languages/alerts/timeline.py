@@ -167,17 +167,11 @@ class PlexTimeline(PlexAlert):
         if self.has_metadata_state:
             item.reload()
 
-            # Skip metadata-only events that did not change episode media parts
-            if not plex.cache.did_episode_parts_change(item):
-                return
-
-            # Check if the updated item has already been processed
-            if not plex.cache.should_process_recently_updated(item.key):
-                return
-
-            # Change tracks for all users
-            logger.info(f"[Timeline] Processing updated episode {plex.get_episode_short_name(item)}")
-            plex.process_new_or_updated_episode(item.key, EventType.UPDATED_EPISODE, False)
+            # A media change is not processed here: a file still being written emits
+            # one of these per Plex re-analysis. The episode starts settling and
+            # PlexServer.process_settled_episodes() handles it once it stops changing.
+            if plex.cache.note_episode_parts(item):
+                logger.debug(f"[Timeline] Media changed for {plex.get_episode_short_name(item)}; waiting for it to settle")
             return
 
         # Check if the item has been added recently

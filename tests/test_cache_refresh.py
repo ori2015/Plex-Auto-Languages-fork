@@ -24,34 +24,35 @@ def _cache(episode_parts, episodes):
     cache._is_refreshing = False
     cache._last_refresh = datetime.fromtimestamp(0)
     cache.episode_parts = dict(episode_parts)
+    cache.settling = {}
     cache.save = lambda force=False: None
     return cache
 
 
-def test_refresh_returns_added_and_updated_and_swaps_parts():
+def test_refresh_returns_added_settles_changed_and_swaps_parts():
     cache = _cache(
         {
-            "/library/metadata/1": ["/part/old"],  # changes below -> updated
+            "/library/metadata/1": ["/part/old"],  # changes below -> settling
             "/library/metadata/3": ["/part/b"],    # unchanged below -> skipped
         },
         [
-            _episode("/library/metadata/1", ["/part/new"]),  # changed -> updated
+            _episode("/library/metadata/1", ["/part/new"]),  # changed -> settling
             _episode("/library/metadata/2", ["/part/a"]),    # new -> added
             _episode("/library/metadata/3", ["/part/b"]),    # unchanged -> skipped
         ],
     )
 
-    added, updated = cache.refresh_library_cache()
+    added = cache.refresh_library_cache()
 
     assert [r.key for r in added] == ["/library/metadata/2"]
-    assert [r.key for r in updated] == ["/library/metadata/1"]
+    assert list(cache.settling) == ["/library/metadata/1"]
     assert cache.episode_parts["/library/metadata/3"] == ["/part/b"]
     assert cache.episode_parts["/library/metadata/2"] == ["/part/a"]
 
 
 def test_refresh_diffs_against_snapshot_not_live_dict():
     # A metadataState consumer mutates the live dict mid-refresh (concurrent
-    # did_episode_parts_change); the diff must still compare against the parts
+    # note_episode_parts); the diff must still compare against the parts
     # recorded at refresh start, or the change would be missed.
     cache = _cache(
         {"/library/metadata/1": ["/part/old"]},
@@ -60,14 +61,14 @@ def test_refresh_diffs_against_snapshot_not_live_dict():
     original_iter = cache._plex.iter_episodes
     cache._plex.iter_episodes = lambda: _mutate_mid_iteration(cache, original_iter)
 
-    _, updated = cache.refresh_library_cache()
+    cache.refresh_library_cache()
 
-    assert [r.key for r in updated] == ["/library/metadata/1"]
+    assert list(cache.settling) == ["/library/metadata/1"]
 
 
 def _mutate_mid_iteration(cache, original_iter):
     yield next(original_iter())
-    # Simulate did_episode_parts_change() updating the live cache while the
+    # Simulate note_episode_parts() updating the live cache while the
     # refresh is still iterating.
     cache.episode_parts["/library/metadata/1"] = ["/part/new"]
 
@@ -76,9 +77,7 @@ def test_refresh_is_reentrant_guard():
     cache = _cache({}, [])
     cache._is_refreshing = True
 
-    added, updated = cache.refresh_library_cache()
-
-    assert (added, updated) == ([], [])
+    assert cache.refresh_library_cache() == []
 
 
 def _status_plex(calls, refresh_library_on_scan=True, last_refresh=None):
@@ -86,7 +85,7 @@ def _status_plex(calls, refresh_library_on_scan=True, last_refresh=None):
     plex.config = {"refresh_library_on_scan": refresh_library_on_scan}
     plex.cache = SimpleNamespace(
         last_refresh=last_refresh or datetime.fromtimestamp(0),
-        refresh_library_cache=lambda: (calls.append("full"), ([], []))[1],
+        refresh_library_cache=lambda: (calls.append("full"), [])[1],
     )
     plex.get_recently_added_episode_refs = lambda minutes=5: (calls.append("cheap"), [])[1]
     return plex

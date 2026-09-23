@@ -2,6 +2,7 @@ import os
 import signal
 import argparse
 import time
+import threading
 from time import sleep
 from websocket import WebSocketConnectionClosedException, WebSocketTimeoutException
 
@@ -279,6 +280,9 @@ class PlexAutoLanguages:
                     self.must_stop = True
                 if count % 300 == 0:  # Every 5 minutes
                     self.plex.cache.clean_idle_caches()
+                if count % 60 == 0:  # Every minute; off-thread so a large batch cannot stall this loop
+                    threading.Thread(target=self.plex.process_settled_episodes,
+                                     name="settle", daemon=True).start()
 
             # Clean up when stopping
             self.alive = False
