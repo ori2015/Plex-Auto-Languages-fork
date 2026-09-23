@@ -80,6 +80,7 @@ class PlexStatus(PlexAlert):
 
         # Scoped to this handler call so it cannot serve stale labels later.
         show_memo: dict = {}
+        reference_memo: dict = {}
 
         # Process recently added episodes
         if len(added) > 0:
@@ -101,7 +102,7 @@ class PlexStatus(PlexAlert):
 
                 # Change tracks for all users
                 logger.info(f"[Status] Processing newly added episode {name}")
-                plex.process_new_or_updated_episode(ref.key, EventType.NEW_EPISODE, True)
+                plex.process_new_or_updated_episode(ref.key, EventType.NEW_EPISODE, True, reference_memo)
 
         # Process updated episodes
         if len(updated) > 0:
@@ -123,4 +124,4 @@ class PlexStatus(PlexAlert):
 
                 # Change tracks for all users
                 logger.info(f"[Status] Processing updated episode {name}")
-                plex.process_new_or_updated_episode(ref.key, EventType.UPDATED_EPISODE, False)
+                plex.process_new_or_updated_episode(ref.key, EventType.UPDATED_EPISODE, False, reference_memo)

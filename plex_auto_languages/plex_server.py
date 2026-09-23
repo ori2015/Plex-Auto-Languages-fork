@@ -740,7 +740,8 @@ class PlexServer(UnprivilegedPlexServer):
             logger.warning(f"Error checking file patterns for episode: {e}")
         return False
 
-    def process_new_or_updated_episode(self, item_id: Union[int, str], event_type: EventType, new: bool) -> None:
+    def process_new_or_updated_episode(self, item_id: Union[int, str], event_type: EventType, new: bool,
+                                       reference_memo: Optional[dict] = None) -> None:
         """
         Process a newly added or updated episode for all users.
 
@@ -750,6 +751,11 @@ class PlexServer(UnprivilegedPlexServer):
             item_id (Union[int, str]): The ID of the episode.
             event_type (EventType): The type of event that triggered this processing.
             new (bool): Whether the episode is newly added (True) or updated (False).
+            reference_memo (Optional[dict]): Maps (user_id, show_key) to the user's loaded
+                reference episode. Callers processing a batch pass one dict for the whole
+                batch, so a season arriving at once costs one watched()/reload() round per
+                user and show instead of one per episode. Scope it to the batch: a
+                long-lived memo would miss what the user watches afterwards.
         """
         track_changes = NewOrUpdatedTrackChanges(event_type, new)
         def process_user(user_id):
@@ -763,12 +769,19 @@ class PlexServer(UnprivilegedPlexServer):
                 user_item = user_plex.fetch_item(item_id)
                 if user_item is None:
                     return None
-                reference = user_plex.get_last_watched_or_first_episode(user_item.show())
+                memo_key = (user_id, user_item.grandparentRatingKey)
+                if reference_memo is not None and memo_key in reference_memo:
+                    reference = reference_memo[memo_key]
+                else:
+                    reference = user_plex.get_last_watched_or_first_episode(user_item.show())
+                    if reference is not None:
+                        reference.reload()
+                    if reference_memo is not None:
+                        reference_memo[memo_key] = reference
                 if reference is None:
                     return None
 
                 # Change tracks
-                reference.reload()
                 user_item.reload()
                 user = self.get_user_by_id(user_id)
                 if user is None:
@@ -862,6 +875,7 @@ class PlexServer(UnprivilegedPlexServer):
         added, updated = self.cache.refresh_library_cache()
         # Scoped to this loop so it cannot serve stale labels on a later run.
         show_memo: dict = {}
+        reference_memo: dict = {}
         for ref in added:
             if self.should_ignore_library(ref.library_section_title):
                 continue
@@ -873,7 +887,7 @@ class PlexServer(UnprivilegedPlexServer):
                 continue
             name = self.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
             logger.info(f"[Scheduler] Processing newly added episode {name}")
-            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, True)
+            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, True, reference_memo)
         for ref in updated:
             if self.should_ignore_library(ref.library_section_title):
                 continue
@@ -885,7 +899,7 @@ class PlexServer(UnprivilegedPlexServer):
                 continue
             name = self.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
             logger.info(f"[Scheduler] Processing updated episode {name}")
-            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, False)
+            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, False, reference_memo)
         logger.info("[Scheduler] Deep analysis completed")
 
     def stop(self) -> None:

@@ -19,6 +19,25 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def part_identity(part_key: str) -> str:
+    """
+    Strip the file modification time from a Plex media part key.
+
+    Plex part keys look like /library/parts/<id>/<mtime>/file.<ext>. The mtime
+    segment changes whenever the file is written to, e.g. while a torrent client
+    is still downloading into the library, so comparing raw keys reports the
+    episode as updated on every scan. A genuinely replaced file (e.g. a Sonarr
+    upgrade) gets a new part id, so the id and extension are enough to detect it.
+
+    Keys that do not match that shape are returned unchanged, which also makes
+    the function idempotent.
+    """
+    segments = part_key.split("/")
+    if len(segments) == 6 and segments[1:3] == ["library", "parts"] and segments[4].isdigit():
+        del segments[4]
+    return "/".join(segments)
+
+
 class PlexServerCache:
     """
     Manages caching for Plex server data to improve performance and reduce API calls.
@@ -41,7 +60,7 @@ class PlexServerCache:
         _instance_users (list): List of users with access to the Plex server.
         _instance_user_tokens (dict): Maps user IDs to their authentication tokens.
         _instance_users_valid_until (datetime): Expiration timestamp for cached user data.
-        episode_parts (dict): Maps episode keys to their media part keys.
+        episode_parts (dict): Maps episode keys to their media part identities (see part_identity).
         _legacy_cache_file_path (str): Legacy JSON cache path used for one-time migration.
         _db_path (str): Path to the SQLite cache database file.
         _cache_file_path (str): Backwards-compatible alias for cache storage path usage.
@@ -248,7 +267,9 @@ class PlexServerCache:
             except json.JSONDecodeError:
                 part_keys = []
 
-            self.episode_parts[episode_key] = part_keys
+            # Normalizing here keeps caches written by older versions, which
+            # stored raw keys, from reporting the whole library as updated.
+            self.episode_parts[episode_key] = [part_identity(key) for key in part_keys]
 
             parsed_added_at = self._parse_datetime(newly_added_at)
             if parsed_added_at is not None:
@@ -320,7 +341,7 @@ class PlexServerCache:
         self.episode_parts = {}
         if isinstance(raw_episode_parts, dict):
             for key, value in raw_episode_parts.items():
-                self.episode_parts[key] = value if isinstance(value, list) else []
+                self.episode_parts[key] = [part_identity(k) for k in value] if isinstance(value, list) else []
 
         self._last_refresh = self._parse_datetime(cache.get("last_refresh"), datetime.fromtimestamp(0)) or datetime.fromtimestamp(0)
 
@@ -399,7 +420,7 @@ class PlexServerCache:
             current_parts = []
             for part in episode.iterParts():
                 if part.key:
-                    current_parts.append(part.key)
+                    current_parts.append(part_identity(part.key))
 
             previous_parts = self.episode_parts.get(episode.key)
             self.episode_parts[episode.key] = current_parts
@@ -473,7 +494,7 @@ class PlexServerCache:
                 part_list = new_episode_parts.setdefault(episode.key, [])
                 files = []
                 for part in episode.iterParts():
-                    part_list.append(part.key)
+                    part_list.append(part_identity(part.key))
                     if collect_files and getattr(part, "file", None):
                         files.append(part.file)
 
