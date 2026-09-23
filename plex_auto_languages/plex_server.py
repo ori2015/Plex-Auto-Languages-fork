@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 from requests import ConnectionError as RequestsConnectionError
 from urllib3.exceptions import InsecureRequestWarning
 from plexapi.media import MediaPart
-from plexapi.library import ShowSection
-from plexapi.video import Episode, Show
+from plexapi.library import ShowSection, MovieSection
+from plexapi.video import Episode, Movie, Show
 from plexapi.exceptions import NotFound, Unauthorized, BadRequest
 from plexapi.server import PlexServer as BasePlexServer
 
@@ -20,7 +20,8 @@ from plex_auto_languages.utils.logger import get_logger
 from plex_auto_languages.utils.configuration import Configuration
 from plex_auto_languages.plex_alert_handler import PlexAlertHandler
 from plex_auto_languages.plex_alert_listener import PlexAlertListener
-from plex_auto_languages.track_changes import TrackChanges, NewOrUpdatedTrackChanges
+from plex_auto_languages.track_changes import TrackChanges, NewOrUpdatedTrackChanges, media_name
+from plex_auto_languages.history_profiles import HistoryProfiles
 from plex_auto_languages.utils.notifier import Notifier
 from plex_auto_languages.episode_ref import EpisodeRef
 from plex_auto_languages.plex_server_cache import PlexServerCache
@@ -31,7 +32,7 @@ from plex_auto_languages.exceptions import UserNotFound
 logger = get_logger()
 
 # Shared pool for the per-episode fan-out to all users inside
-# process_new_or_updated_episode. Reused across episodes instead of creating and
+# process_new_or_updated_item. Reused across episodes instead of creating and
 # tearing down a ThreadPoolExecutor on every single episode (which, under the
 # parallelized alert consumer, would otherwise churn thread creation constantly).
 _USER_FANOUT_POOL = concurrent.futures.ThreadPoolExecutor(
@@ -229,6 +230,30 @@ class UnprivilegedPlexServer():
                 # choice.
                 container_start += len(page)
 
+    def iter_movies(self, page_size: int = 1000) -> Iterator[Movie]:
+        """Iterate over all movies from non-ignored movie libraries, one page at a time (see iter_episodes)."""
+        for section in self.get_movie_sections():
+            container_start = 0
+            while True:
+                page = section.search(
+                    libtype="movie",
+                    sort="addedAt:asc",
+                    container_start=container_start,
+                    container_size=page_size,
+                    maxresults=page_size
+                )
+                if not page:
+                    break
+                for movie in page:
+                    movie.librarySectionTitle = section.title  # same reason as iter_episodes
+                yield from page
+                container_start += len(page)
+
+    def iter_library_items(self) -> Iterator[Union[Episode, Movie]]:
+        """Every episode and movie the library cache tracks."""
+        yield from self.iter_episodes()
+        yield from self.iter_movies()
+
     def episodes(self) -> List[Episode]:
         """
         Get all episodes from non-ignored libraries in the Plex server.
@@ -250,6 +275,11 @@ class UnprivilegedPlexServer():
             List[ShowSection]: A list of all non-ignored TV show library sections.
         """
         all_sections = [s for s in self._plex.library.sections() if isinstance(s, ShowSection)]
+        return [s for s in all_sections if not self.should_ignore_library(s.title)]
+
+    def get_movie_sections(self) -> List[MovieSection]:
+        """Get all movie sections from the Plex library that are not ignored."""
+        all_sections = [s for s in self._plex.library.sections() if isinstance(s, MovieSection)]
         return [s for s in all_sections if not self.should_ignore_library(s.title)]
 
     def _refresh_sections_cache(self) -> bool:
@@ -274,23 +304,19 @@ class UnprivilegedPlexServer():
             return False
 
     @staticmethod
-    def get_last_watched_or_first_episode(show: Show) -> Optional[Episode]:
+    def get_show_reference(show: Show) -> Optional[Episode]:
         """
-        Get the most recently watched episode of a show, or the first episode if none have been watched.
+        Get the furthest episode of a show the user has watched or started.
 
         Args:
-            show (Show): The show to get an episode from.
+            show (Show): The show, fetched as the user.
 
         Returns:
-            Optional[Episode]: The last watched episode or first episode, None if the show has no episodes.
+            Optional[Episode]: That episode, or None when the user has neither watched nor
+                started any episode of the show.
         """
-        watched_episodes = show.watched()
-        if len(watched_episodes) == 0:
-            all_episodes = show.episodes()
-            if len(all_episodes) == 0:
-                return None
-            return all_episodes[0]
-        return watched_episodes[-1]
+        started = [e for e in show.episodes() if getattr(e, "viewCount", 0) or getattr(e, "viewOffset", 0)]
+        return started[-1] if started else None
 
     @staticmethod
     def get_selected_streams(episode: Union[Episode, MediaPart]) -> Tuple[Optional[object], Optional[object]]:
@@ -320,6 +346,8 @@ class UnprivilegedPlexServer():
             str: A formatted string representing the episode, e.g., "'Show Title' (S01E02)" or "S01E02".
         """
         try:
+            if getattr(episode, "TYPE", None) == "movie":
+                return f"'{media_name(episode)}'"
             season_num = episode.seasonNumber if episode.seasonNumber is not None else 0
             episode_num = episode.episodeNumber if episode.episodeNumber is not None else 0
             if include_show:
@@ -378,6 +406,7 @@ class PlexServer(UnprivilegedPlexServer):
         self._alert_handler = None
         self._alert_listener = None
         self._settle_lock = threading.Lock()
+        self.history_profiles = HistoryProfiles(self)
         self.cache = PlexServerCache(self)
 
     @property
@@ -609,9 +638,9 @@ class PlexServer(UnprivilegedPlexServer):
         """
         return section_title in self.config.get("ignore_libraries")
 
-    def get_recently_added_episode_refs(self, minutes: int) -> List[EpisodeRef]:
+    def get_recently_added_refs(self, minutes: int) -> List[EpisodeRef]:
         """
-        Get refs for episodes added in the last `minutes` minutes.
+        Get refs for episodes and movies added in the last `minutes` minutes.
 
         Returns refs rather than Episodes so this shares one shape with
         refresh_library_cache(). Its only consumer (the library-scan handler)
@@ -625,7 +654,22 @@ class PlexServer(UnprivilegedPlexServer):
                 # costs a full metadata reload per episode.
                 episode.librarySectionTitle = section.title
                 refs.append(EpisodeRef.from_episode(episode))
+        for section in self.get_movie_sections():
+            for movie in section.search(libtype="movie", sort="addedAt:desc", filters={"addedAt>>": f"{minutes}m"}):
+                movie.librarySectionTitle = section.title
+                refs.append(EpisodeRef.from_episode(movie))
         return refs
+
+    @classmethod
+    def ref_name(cls, ref: EpisodeRef) -> str:
+        """Log name for a ref: the movie title, or the show and episode numbers."""
+        if ref.is_movie:
+            return f"'{ref.title}'"
+        return cls.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
+
+    def history_for_user(self, user_id: Union[int, str], maxresults: int) -> list:
+        """A user's plays, most recent first. The admin reads every account's history."""
+        return self._plex.history(accountID=int(user_id), maxresults=maxresults)
 
     @staticmethod
     def format_ref_name(show_title: str | None, season_number: int | None,
@@ -747,44 +791,68 @@ class PlexServer(UnprivilegedPlexServer):
             logger.warning(f"Error checking file patterns for episode: {e}")
         return False
 
-    def process_new_or_updated_episode(self, item_id: Union[int, str], event_type: EventType, new: bool,
-                                       reference_memo: Optional[dict] = None) -> None:
+    def process_new_or_updated_item(self, item_id: Union[int, str], event_type: EventType, new: bool,
+                                    reference_memo: Optional[dict] = None) -> None:
         """
-        Process a newly added or updated episode for all users.
+        Process a newly added or updated episode or movie for all users.
 
-        Applies language preferences for all users who have access to the episode.
+        Per user, the reference whose tracks are carried over is, in order:
+        1. for an episode of a show the user has played, the furthest episode they watched
+           or started (the show-based propagation this tool always did);
+        2. otherwise, the subtitle preference learned from their history of other titles
+           (see HistoryProfiles), which only ever selects a matching subtitle.
+        A user with neither is skipped without a single request.
 
         Args:
-            item_id (Union[int, str]): The ID of the episode.
+            item_id (Union[int, str]): The ID of the episode or movie.
             event_type (EventType): The type of event that triggered this processing.
-            new (bool): Whether the episode is newly added (True) or updated (False).
+            new (bool): Whether the item is newly added (True) or updated (False).
             reference_memo (Optional[dict]): Maps (user_id, show_key) to the user's loaded
                 reference episode. Callers processing a batch pass one dict for the whole
-                batch, so a season arriving at once costs one watched()/reload() round per
+                batch, so a season arriving at once costs one episodes()/reload() round per
                 user and show instead of one per episode. Scope it to the batch: a
                 long-lived memo would miss what the user watches afterwards.
         """
+        item = self.fetch_item(item_id)
+        if item is None or not isinstance(item, (Episode, Movie)):
+            return
+        show_key = item.grandparentRatingKey if isinstance(item, Episode) else None
         track_changes = NewOrUpdatedTrackChanges(event_type, new)
+
         def process_user(user_id):
             try:
-                # Switch to the user's Plex instance
-                user_plex = self.get_plex_instance_of_user(user_id)
-                if user_plex is None:
-                    return None
+                user_plex = None
 
-                # Get the most recently watched episode or the first one of the show
+                def connect():
+                    nonlocal user_plex
+                    if user_plex is None:
+                        user_plex = self.get_plex_instance_of_user(user_id)
+                    return user_plex
+
+                profile = self.history_profiles.get(user_id, connect)
+                watches_show = show_key is not None and str(show_key) in profile.played_shows
+                if not watches_show and profile.subtitle_reference is None:
+                    return None
+                if connect() is None:
+                    return None
                 user_item = user_plex.fetch_item(item_id)
                 if user_item is None:
                     return None
-                memo_key = (user_id, user_item.grandparentRatingKey)
-                if reference_memo is not None and memo_key in reference_memo:
-                    reference = reference_memo[memo_key]
-                else:
-                    reference = user_plex.get_last_watched_or_first_episode(user_item.show())
-                    if reference is not None:
-                        reference.reload()
-                    if reference_memo is not None:
-                        reference_memo[memo_key] = reference
+
+                reference = None
+                if watches_show:
+                    memo_key = (user_id, show_key)
+                    if reference_memo is not None and memo_key in reference_memo:
+                        reference = reference_memo[memo_key]
+                    else:
+                        reference = user_plex.get_show_reference(user_item.show())
+                        if reference is not None:
+                            reference.reload()
+                        if reference_memo is not None:
+                            reference_memo[memo_key] = reference
+                from_history = reference is None
+                if from_history:
+                    reference = profile.subtitle_reference
                 if reference is None:
                     return None
 
@@ -793,7 +861,7 @@ class PlexServer(UnprivilegedPlexServer):
                 user = self.get_user_by_id(user_id)
                 if user is None:
                     return None
-                return (user.name, reference, user_item)
+                return (user.name, reference, user_item, from_history)
             except Exception as e:
                 logger.error(f"Error processing user {user_id}: {e}")
                 return None
@@ -802,8 +870,8 @@ class PlexServer(UnprivilegedPlexServer):
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             if result is not None:
-                username, reference, user_item = result
-                track_changes.change_track_for_user(username, reference, user_item)
+                username, reference, user_item, from_history = result
+                track_changes.change_track_for_user(username, reference, user_item, from_history)
 
         # Notify changes
         if track_changes.has_changes:
@@ -815,7 +883,7 @@ class PlexServer(UnprivilegedPlexServer):
 
     def process_settled_episodes(self) -> None:
         """
-        Process, once, every episode whose media changed and has since stopped changing.
+        Process, once, every episode or movie whose media changed and has since stopped changing.
 
         Each candidate is fetched again to confirm its parts still match what was last
         seen; if they moved, its settling clock restarts instead. Runs periodically
@@ -829,20 +897,20 @@ class PlexServer(UnprivilegedPlexServer):
             reference_memo: dict = {}
             for key in keys:
                 item = self.fetch_item(key)
-                if item is None or not isinstance(item, Episode):
+                if item is None or not isinstance(item, (Episode, Movie)):
                     self.cache.forget_settling(key)
                     continue
                 if not self.cache.settle(item):
                     continue
-                name = self.format_ref_name(item.grandparentTitle, item.parentIndex, item.index)
-                if self.should_ignore_library(item.librarySectionTitle):
+                ref = EpisodeRef.from_episode(item)
+                if self.should_ignore_library(ref.library_section_title):
                     continue
-                if self.should_ignore_show_by_key(item.grandparentRatingKey, show_memo):
+                if self.should_ignore_show_by_key(ref.labels_key, show_memo):
                     continue
                 if self.should_ignore_filepath(item):
                     continue
-                logger.info(f"[Settle] Processing updated episode {name}")
-                self.process_new_or_updated_episode(key, EventType.UPDATED_EPISODE, False, reference_memo)
+                logger.info(f"[Settle] Processing updated item {self.ref_name(ref)}")
+                self.process_new_or_updated_item(key, EventType.UPDATED_EPISODE, False, reference_memo)
         except Exception as e:
             logger.error(f"[Settle] Failed to process settled episodes: {e}")
         finally:
@@ -921,15 +989,14 @@ class PlexServer(UnprivilegedPlexServer):
         for ref in added:
             if self.should_ignore_library(ref.library_section_title):
                 continue
-            if self.should_ignore_show_by_key(ref.show_key, show_memo):
+            if self.should_ignore_show_by_key(ref.labels_key, show_memo):
                 continue
             if self._matches_ignore_filepattern(ref.part_files):
                 continue
             if not self.cache.should_process_recently_added(ref.key, ref.added_at):
                 continue
-            name = self.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
-            logger.info(f"[Scheduler] Processing newly added episode {name}")
-            self.process_new_or_updated_episode(ref.key, EventType.SCHEDULER, True, reference_memo)
+            logger.info(f"[Scheduler] Processing newly added item {self.ref_name(ref)}")
+            self.process_new_or_updated_item(ref.key, EventType.SCHEDULER, True, reference_memo)
         logger.info("[Scheduler] Deep analysis completed")
 
     def stop(self) -> None:

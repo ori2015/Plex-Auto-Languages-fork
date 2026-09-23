@@ -9,6 +9,23 @@ from plex_auto_languages.constants import EventType
 logger = get_logger()
 
 
+def is_movie(item) -> bool:
+    """Whether a Plex item is a movie (the rest of this module otherwise handles episodes)."""
+    return getattr(item, "TYPE", None) == "movie"
+
+
+def container_title(item) -> str:
+    """The show title for an episode, the movie's own title for a movie."""
+    return item.title if is_movie(item) else item.show().title
+
+
+def media_name(item) -> str:
+    """A log/notification name: "Show (S01E02)" for an episode, "Title (2024)" for a movie."""
+    if is_movie(item):
+        return f"{item.title} ({item.year})" if getattr(item, "year", None) else item.title
+    return f"{item.show().title} (S{item.seasonNumber:02}E{item.episodeNumber:02})"
+
+
 class TrackChanges():
     """
     Manages audio and subtitle track changes for Plex episodes.
@@ -30,18 +47,25 @@ class TrackChanges():
         _description (str): Human-readable description of the changes.
         _title (str): Title for the change notification.
         _computed (bool): Whether changes have been computed.
+        _from_history (bool): Whether the reference comes from the user's history of other
+            titles rather than from the same show (see HistoryProfiles).
     """
 
-    def __init__(self, username: str, reference: Episode, event_type: EventType):
+    def __init__(self, username: str, reference: Episode, event_type: EventType, from_history: bool = False):
         """
         Initialize a TrackChanges instance.
 
         Args:
             username (str): The username associated with these track changes.
-            reference (Episode): The reference episode used as a template.
+            reference (Episode): The reference episode (or movie) used as a template.
             event_type (EventType): The type of event that triggered these changes.
+            from_history (bool): The reference is another title from the user's history. Only
+                its subtitle choice carries over, and only onto a matching track: audio is left
+                alone and subtitles are never cleared, since a habit learned on other titles is
+                no evidence about this one's audio or about turning subtitles off.
         """
         self._reference = reference
+        self._from_history = from_history
         self._username = username
         self._event_type = event_type
         self._audio_stream, self._subtitle_stream = self._get_selected_streams(reference)
@@ -117,7 +141,7 @@ class TrackChanges():
         Returns:
             str: The episode name in the format "Show Title (S01E02)".
         """
-        return f"{self._reference.show().title} (S{self._reference.seasonNumber:02}E{self._reference.episodeNumber:02})"
+        return media_name(self._reference)
 
     @property
     def has_changes(self) -> bool:
@@ -180,8 +204,8 @@ class TrackChanges():
         Args:
             episodes (List[Episode]): The list of episodes to analyze.
         """
-        logger.debug(f"[Language Update] Checking language update for show '{self._reference.show().title}' "
-                     f"and user '{self._username}' based on episode: 'S{self._reference.seasonNumber:02}E{self._reference.episodeNumber:02}'")
+        logger.debug(f"[Language Update] Checking language update for user '{self._username}' "
+                     f"based on {'history item' if self._from_history else 'episode'}: '{media_name(self._reference)}'")
         self._changes = []
         reference_has_subtitle_streams = len(self._reference.subtitleStreams()) > 0
         for episode in episodes:
@@ -189,7 +213,7 @@ class TrackChanges():
             for part in episode.iterParts():
                 current_audio_stream, current_subtitle_stream = self._get_selected_streams(part)
                 # Audio stream
-                matching_audio_stream = self._match_audio_stream(part.audioStreams())
+                matching_audio_stream = None if self._from_history else self._match_audio_stream(part.audioStreams())
                 if current_audio_stream is not None and matching_audio_stream is not None and \
                         matching_audio_stream.id != current_audio_stream.id:
                     self._changes.append((episode, part, AudioStream.STREAMTYPE, matching_audio_stream))
@@ -201,7 +225,7 @@ class TrackChanges():
                 # This avoids disabling subtitles on episodes that do have subtitle streams while the reference episode
                 # simply has burned-in subtitles or no subtitle track available.
                 
-                if current_subtitle_stream is not None and matching_subtitle_stream is None:
+                if current_subtitle_stream is not None and matching_subtitle_stream is None and not self._from_history:
                     if self._subtitle_stream is None:
                         if reference_has_subtitle_streams:
                             # Reference has subtitle streams and subtitles are explicitly off -> clear current subtitle.
@@ -223,8 +247,7 @@ class TrackChanges():
                     if current_audio_stream is not None and current_audio_stream.title is not None and \
                             "commentary" in current_audio_stream.title.lower() and matching_audio_stream is None:
                         # if the changed stream was commentary but this ep has none, then don't touch subs
-                        logger.debug(f"[Language Update] Skipping subtitle changes for show '{episode.show().title}' "
-                                     f"episode 'S{episode.seasonNumber:02}E{episode.episodeNumber:02}' "
+                        logger.debug(f"[Language Update] Skipping subtitle changes for '{media_name(episode)}' "
                                      f"and user '{self.username}'")
                     else:
                         self._changes.append((episode, part, SubtitleStream.STREAMTYPE, matching_subtitle_stream))
@@ -239,13 +262,13 @@ class TrackChanges():
         according to the computed changes.
         """
         if not self.has_changes:
-            logger.debug(f"[Language Update] No changes to perform for show '{self._reference.show().title}' and user '{self._username}'")
+            logger.debug(f"[Language Update] No changes to perform for user '{self._username}' "
+                         f"based on '{media_name(self._reference)}'")
             return
-        logger.debug(f"[Language Update] Performing {len(self._changes)} change(s) for show '{self._reference.show().title}'")
+        logger.debug(f"[Language Update] Performing {len(self._changes)} change(s) for user '{self._username}'")
         for episode, part, stream_type, new_stream in self._changes:
             stream_type_name = "audio" if stream_type == AudioStream.STREAMTYPE else "subtitle"
-            logger.debug(f"[Language Update] Updating {stream_type_name} stream of show '{episode.show().title}' "
-                         f"episode 'S{episode.seasonNumber:02}E{episode.episodeNumber:02}' to "
+            logger.debug(f"[Language Update] Updating {stream_type_name} stream of '{media_name(episode)}' to "
                          f"'{(new_stream.extendedDisplayTitle or new_stream.title or 'Unknown') if new_stream else 'Disabled'}'")
             try:
                 if stream_type == AudioStream.STREAMTYPE:
@@ -255,8 +278,8 @@ class TrackChanges():
                 elif stream_type == SubtitleStream.STREAMTYPE:
                     part.setSelectedSubtitleStream(new_stream)
             except Exception as e:
-                logger.error(f"[Language Update] Failed to update {stream_type_name} stream for episode "
-                             f"'S{episode.seasonNumber:02}E{episode.episodeNumber:02}' of show '{episode.show().title}': {e}")
+                logger.error(f"[Language Update] Failed to update {stream_type_name} stream for "
+                             f"'{media_name(episode)}': {e}")
         # Clear changes and references to free memory
         self._changes.clear()
         self._reference = None
@@ -295,10 +318,12 @@ class TrackChanges():
             self._description = ""
             return
 
-        valid_episodes = [e for e in episodes if e.seasonNumber is not None and e.episodeNumber is not None]
-        invalid_episodes = [e for e in episodes if e.seasonNumber is None or e.episodeNumber is None]
+        valid_episodes = [e for e in episodes if not is_movie(e) and e.seasonNumber is not None and e.episodeNumber is not None]
+        invalid_episodes = [e for e in episodes if not is_movie(e) and (e.seasonNumber is None or e.episodeNumber is None)]
 
-        if valid_episodes:
+        if all(is_movie(e) for e in episodes):
+            range_str = ", ".join(media_name(e) for e in episodes)
+        elif valid_episodes:
             season_numbers = [e.seasonNumber for e in valid_episodes]
             min_season_number, max_season_number = min(season_numbers), max(season_numbers)
             min_episode_number = min([e.episodeNumber for e in valid_episodes if e.seasonNumber == min_season_number])
@@ -311,7 +336,7 @@ class TrackChanges():
 
         nb_updated = len({e.key for e, _, _, _ in self._changes})
         nb_total = len(episodes)
-        self._title = self._reference.show().title
+        self._title = container_title(self._reference)
 
         # Build subtitles text cleanly
         if self._subtitle_stream is not None:
@@ -324,7 +349,7 @@ class TrackChanges():
 
         # Build description safely and clearly
         self._description = (
-            f"Show: {self._reference.show().title}\n"
+            f"{'Movie' if is_movie(self._reference) else 'Show'}: {container_title(self._reference)}\n"
             f"User: {self._username}\n"
             f"Audio: {self._audio_stream.displayTitle if self._audio_stream is not None else 'None'}\n"
             f"Subtitles: {sub_title}\n"
@@ -725,7 +750,7 @@ class NewOrUpdatedTrackChanges():
         """
         if self._episode is None:
             return ""
-        return f"{self._episode.show().title} (S{self._episode.seasonNumber:02}E{self._episode.episodeNumber:02})"
+        return media_name(self._episode)
 
     @property
     def event_type(self) -> EventType:
@@ -777,7 +802,8 @@ class NewOrUpdatedTrackChanges():
         """
         return len(self._track_changes) > 0
 
-    def change_track_for_user(self, username: str, reference: Episode, episode: Episode) -> None:
+    def change_track_for_user(self, username: str, reference: Episode, episode: Episode,
+                              from_history: bool = False) -> None:
         """
         Apply track changes for a specific user based on their reference episode.
 
@@ -786,11 +812,12 @@ class NewOrUpdatedTrackChanges():
 
         Args:
             username (str): The username to apply changes for.
-            reference (Episode): The reference episode with the user's preferred tracks.
-            episode (Episode): The episode to apply changes to.
+            reference (Episode): The reference episode (or history item) with the user's preferred tracks.
+            episode (Episode): The episode or movie to apply changes to.
+            from_history (bool): The reference comes from the user's history (see TrackChanges).
         """
         self._episode = episode
-        track_changes = TrackChanges(username, reference, self._event_type)
+        track_changes = TrackChanges(username, reference, self._event_type, from_history)
         track_changes.compute([episode])
         changes_were_made = track_changes.has_changes
         track_changes.apply()
@@ -812,8 +839,9 @@ class NewOrUpdatedTrackChanges():
             return
         event_str = "New" if self._new else "Updated"
         self._title = f"{event_str}: {self.episode_name}"
+        kind = "movie" if is_movie(self._episode) else "episode"
         self._description = (
-            f"Episode: {self.episode_name}\n"
-            f"Status: {event_str} episode\n"
+            f"{kind.capitalize()}: {self.episode_name}\n"
+            f"Status: {event_str} {kind}\n"
             f"Updated for all users"
         )

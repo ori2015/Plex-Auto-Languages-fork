@@ -22,6 +22,9 @@ class EpisodeRef:
 
     Note show_title comes from grandparentTitle, which is NOT always the same as
     show().title: a show with an empty title reports grandparentTitle = None.
+
+    Movies use the same shape (media_type "movie"): the show and season/episode
+    fields are None and title carries the movie's name.
     """
 
     key: str
@@ -32,6 +35,17 @@ class EpisodeRef:
     show_title: str | None
     show_key: int | None
     part_files: tuple[str, ...] = field(default=())
+    media_type: str = "episode"
+    title: str | None = None
+
+    @property
+    def is_movie(self) -> bool:
+        return self.media_type == "movie"
+
+    @property
+    def labels_key(self):
+        """Rating key of the item whose labels decide ignore_labels: the show, or the movie itself."""
+        return self.key if self.is_movie else self.show_key
 
     @classmethod
     def from_episode(cls, episode, collect_part_files: bool = False) -> "EpisodeRef":
@@ -64,4 +78,6 @@ class EpisodeRef:
             show_title=getattr(episode, "grandparentTitle", None),
             show_key=getattr(episode, "grandparentRatingKey", None),
             part_files=part_files,
+            media_type=getattr(episode, "TYPE", None) or "episode",
+            title=getattr(episode, "title", None),
         )

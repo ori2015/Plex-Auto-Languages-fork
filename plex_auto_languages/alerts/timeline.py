@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from datetime import datetime, timedelta
-from plexapi.video import Episode
+from plexapi.video import Episode, Movie
 
 from plex_auto_languages.alerts.base import PlexAlert
 from plex_auto_languages.utils.logger import get_logger
@@ -144,24 +144,25 @@ class PlexTimeline(PlexAlert):
         if self.identifier != "com.plexapp.plugins.library" or self.state != 5 or self.entry_type == -1:
             return
 
-        # Skip if not an Episode
+        # Skip if not an Episode or a Movie
         item = plex.fetch_item(self.item_id)
-        if item is None or not isinstance(item, Episode):
+        if item is None or not isinstance(item, (Episode, Movie)):
             return
+        name = plex.get_episode_short_name(item)
 
         # Skip if the library should be ignored
         if plex.should_ignore_library(item.librarySectionTitle):
-            logger.debug(f"[Timeline] Ignoring show: '{item.show().title}' episode: 'S{item.seasonNumber:02}E{item.episodeNumber:02}' due to ignored library: '{item.librarySectionTitle}'")
+            logger.debug(f"[Timeline] Ignoring {name} due to ignored library: '{item.librarySectionTitle}'")
             return
 
-        # Skip if the show should be ignored
-        if plex.should_ignore_show(item.show()):
-            logger.debug(f"[Timeline] Ignoring show: '{item.show().title}' episode: 'S{item.seasonNumber:02}E{item.episodeNumber:02}' due to Plex show labels")
+        # Skip if the show (or the movie itself) carries an ignore label
+        if plex.should_ignore_show(item.show() if isinstance(item, Episode) else item):
+            logger.debug(f"[Timeline] Ignoring {name} due to Plex labels")
             return
 
         # Skip if the file path matches an ignore pattern
         if plex.should_ignore_filepath(item):
-            logger.debug(f"[Timeline] Ignoring show: '{item.show().title}' episode: 'S{item.seasonNumber:02}E{item.episodeNumber:02}' due to file path matching ignore pattern")
+            logger.debug(f"[Timeline] Ignoring {name} due to file path matching ignore pattern")
             return
 
         if self.has_metadata_state:
@@ -171,7 +172,7 @@ class PlexTimeline(PlexAlert):
             # one of these per Plex re-analysis. The episode starts settling and
             # PlexServer.process_settled_episodes() handles it once it stops changing.
             if plex.cache.note_episode_parts(item):
-                logger.debug(f"[Timeline] Media changed for {plex.get_episode_short_name(item)}; waiting for it to settle")
+                logger.debug(f"[Timeline] Media changed for {name}; waiting for it to settle")
             return
 
         # Check if the item has been added recently
@@ -183,5 +184,5 @@ class PlexTimeline(PlexAlert):
             return
 
         # Change tracks for all users
-        logger.info(f"[Timeline] Processing newly added episode {plex.get_episode_short_name(item)}")
-        plex.process_new_or_updated_episode(self.item_id, EventType.NEW_EPISODE, True)
+        logger.info(f"[Timeline] Processing newly added item {name}")
+        plex.process_new_or_updated_item(self.item_id, EventType.NEW_EPISODE, True)

@@ -501,6 +501,12 @@ class PlexServerCache:
             # A cold cache diffs against nothing, so every episode would land in
             # `added` and be retained for a result the caller throws away.
             collect_changes = bool(previous_parts)
+            # Items missing from the snapshot count as added only when Plex added
+            # them since that refresh (with an hour of slack for clock skew).
+            # Anything older was never tracked, e.g. a library section that just
+            # became covered, and processing it would override every user's
+            # existing choices across that whole section.
+            added_since = self._last_refresh - timedelta(hours=1)
             # Only worth recording media paths when a pattern is configured;
             # the shipped default ([""]) disables the check entirely.
             collect_files = bool([p for p in self._plex.config.get("ignore_filepatterns") if p])
@@ -514,7 +520,7 @@ class PlexServerCache:
             # Iterate lazily: holding the whole library at once costs >1GB on
             # large libraries, which is enough to get the process OOM-killed
             # before the refresh completes.
-            for episode in self._plex.iter_episodes():
+            for episode in self._plex.iter_library_items():
                 part_list = new_episode_parts.setdefault(episode.key, [])
                 files = []
                 for part in episode.iterParts():
@@ -529,13 +535,16 @@ class PlexServerCache:
                     if previous_parts[episode.key] and parts_changed(previous_parts[episode.key], part_list):
                         changed.append(episode.key)
                     continue
+                added_at = getattr(episode, "addedAt", None)
+                if added_at is not None and added_at < added_since:
+                    continue
 
                 # Record only what the consumers read. Retaining the Episode
                 # costs ~12KB each, which is enough to OOM the process when a
                 # bulk change adds a large part of the library.
                 added.append(EpisodeRef(
                     key=episode.key,
-                    added_at=getattr(episode, "addedAt", None),
+                    added_at=added_at,
                     library_section_title=getattr(episode, "librarySectionTitle", None),
                     # parentIndex, not seasonNumber - see EpisodeRef.from_episode.
                     # seasonNumber can fetch over the network from inside this loop.
@@ -544,6 +553,8 @@ class PlexServerCache:
                     show_title=getattr(episode, "grandparentTitle", None),
                     show_key=getattr(episode, "grandparentRatingKey", None),
                     part_files=tuple(files),
+                    media_type=getattr(episode, "TYPE", None) or "episode",
+                    title=getattr(episode, "title", None),
                 ))
 
             with self._lock:

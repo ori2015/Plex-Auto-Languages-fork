@@ -115,6 +115,9 @@ class PlexPlaying(PlexAlert):
         if item is None or not isinstance(item, Episode):
             return
 
+        # A show started today counts as played before the daily history rebuild
+        plex.history_profiles.note_played(user_id, item.grandparentRatingKey)
+
         # Skip if the library should be ignored
         if plex.should_ignore_library(item.librarySectionTitle):
             logger.debug(f"[Play Session] Ignoring show: '{item.show().title}' episode: 'S{item.seasonNumber:02}E{item.episodeNumber:02}' due to ignored library: '{item.librarySectionTitle}'")

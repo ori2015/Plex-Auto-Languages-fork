@@ -146,3 +146,31 @@ class FakeEpisode:
         if isinstance(self._show, _Raises):
             raise RuntimeError("simulated plexapi NotFound")
         return self._show
+
+
+class FakeMovie:
+    TYPE = "movie"
+
+    def __init__(self, key="/library/metadata/500", title="Some Movie", year=2024, added_at=None,
+                 library_section_title="Movies", parts=None):
+        self.key = key
+        self.title = title
+        self.year = year
+        self.addedAt = added_at
+        self.librarySectionTitle = library_section_title
+        self.parts = parts if parts is not None else [FakePart(key="/part/m")]
+        self.media = [FakeMedia(self.parts)]
+        self.labels = []
+
+    def iterParts(self):
+        for media in self.media:
+            yield from media.parts
+
+    def reload(self):
+        pass
+
+    def audioStreams(self):
+        return [s for part in self.parts for s in part.audioStreams()]
+
+    def subtitleStreams(self):
+        return [s for part in self.parts for s in part.subtitleStreams()]

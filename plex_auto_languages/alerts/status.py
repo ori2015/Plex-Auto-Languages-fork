@@ -51,8 +51,8 @@ class PlexStatus(PlexAlert):
         Processes the status event and triggers appropriate actions.
 
         This method handles library scan completion events by:
-        1. Refreshing the library cache or fetching recently added episodes
-        2. Processing newly added episodes for all users
+        1. Refreshing the library cache or fetching recently added episodes and movies
+        2. Processing newly added items for all users
         3. Applying appropriate track selection based on user preferences
         4. Skipping items from ignored libraries
 
@@ -74,26 +74,26 @@ class PlexStatus(PlexAlert):
                 added = plex.cache.refresh_library_cache()
             else:
                 logger.debug("[Status] Library cache refreshed recently; using recently-added query")
-                added = plex.get_recently_added_episode_refs(minutes=5)
+                added = plex.get_recently_added_refs(minutes=5)
         else:
-            added = plex.get_recently_added_episode_refs(minutes=5)
+            added = plex.get_recently_added_refs(minutes=5)
 
         # Scoped to this handler call so it cannot serve stale labels later.
         show_memo: dict = {}
         reference_memo: dict = {}
 
-        # Process recently added episodes
+        # Process recently added episodes and movies
         if len(added) > 0:
-            logger.debug(f"[Status] Found {len(added)} newly added episode(s)")
+            logger.debug(f"[Status] Found {len(added)} newly added item(s)")
             for ref in added:
-                name = plex.format_ref_name(ref.show_title, ref.season_number, ref.episode_number)
+                name = plex.ref_name(ref)
                 # Check if the library should be ignored
                 if plex.should_ignore_library(ref.library_section_title):
-                    logger.debug(f"[Status] Ignoring episode {name} due to ignored library: '{ref.library_section_title}'")
+                    logger.debug(f"[Status] Ignoring {name} due to ignored library: '{ref.library_section_title}'")
                     continue
 
                 # Check if the item should be ignored
-                if plex.should_ignore_show_by_key(ref.show_key, show_memo):
+                if plex.should_ignore_show_by_key(ref.labels_key, show_memo):
                     continue
 
                 # Check if the item has already been processed
@@ -101,5 +101,5 @@ class PlexStatus(PlexAlert):
                     continue
 
                 # Change tracks for all users
-                logger.info(f"[Status] Processing newly added episode {name}")
-                plex.process_new_or_updated_episode(ref.key, EventType.NEW_EPISODE, True, reference_memo)
+                logger.info(f"[Status] Processing newly added item {name}")
+                plex.process_new_or_updated_item(ref.key, EventType.NEW_EPISODE, True, reference_memo)

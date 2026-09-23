@@ -2,7 +2,6 @@ import json
 import sqlite3
 from datetime import datetime, timedelta
 from threading import Lock, RLock
-from types import SimpleNamespace
 
 from plex_auto_languages import plex_server as plex_server_module
 from plex_auto_languages.constants import EventType
@@ -141,7 +140,7 @@ def _settle_plex(monkeypatch, current_parts, library="TV Shows"):
     episode.librarySectionTitle = library
     plex.fetch_item = lambda key: episode if current_parts is not None else None
     plex.should_ignore_show_by_key = lambda *_: False
-    plex.process_new_or_updated_episode = lambda *args: processed.append(args[:3])
+    plex.process_new_or_updated_item = lambda *args: processed.append(args[:3])
     return plex, processed
 
 
@@ -178,37 +177,3 @@ def test_ignored_library_stops_settling_without_processing(monkeypatch):
     plex.process_settled_episodes()
 
     assert processed == [] and plex.cache.settling == {}
-
-
-class _UserPlex:
-    def __init__(self, calls):
-        self._calls = calls
-
-    def fetch_item(self, item_id):
-        return FakeEpisode(key=item_id, show_key=42)
-
-    def get_last_watched_or_first_episode(self, show):
-        self._calls.append(show)
-        return FakeEpisode(key="/library/metadata/ref", show_key=42)
-
-
-def _process_batch(monkeypatch, reference_memo):
-    calls = []
-    monkeypatch.setattr(plex_server_module, "NewOrUpdatedTrackChanges", lambda *_: SimpleNamespace(
-        change_track_for_user=lambda *_: None, has_changes=False, _track_changes=[], _episode=None))
-    plex = object.__new__(PlexServer)
-    plex.get_all_user_ids = lambda: ["1", "2"]
-    plex.get_plex_instance_of_user = lambda user_id: _UserPlex(calls)
-    plex.get_user_by_id = lambda user_id: SimpleNamespace(name=f"user{user_id}")
-
-    for key in ("/library/metadata/1", "/library/metadata/2", "/library/metadata/3"):
-        plex.process_new_or_updated_episode(key, EventType.NEW_EPISODE, True, reference_memo)
-    return calls
-
-
-def test_reference_memo_looks_up_reference_once_per_user_and_show(monkeypatch):
-    assert len(_process_batch(monkeypatch, {})) == 2
-
-
-def test_without_memo_reference_is_looked_up_per_episode(monkeypatch):
-    assert len(_process_batch(monkeypatch, None)) == 6

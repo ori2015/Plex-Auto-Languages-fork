@@ -17,7 +17,7 @@ def _episode(key, part_keys):
 def _cache(episode_parts, episodes):
     plex = object.__new__(PlexServer)
     plex.config = {"ignore_filepatterns": [""]}
-    plex.iter_episodes = lambda: iter(episodes)
+    plex.iter_library_items = lambda: iter(episodes)
     cache = object.__new__(PlexServerCache)
     cache._plex = plex
     cache._lock = RLock()
@@ -58,8 +58,8 @@ def test_refresh_diffs_against_snapshot_not_live_dict():
         {"/library/metadata/1": ["/part/old"]},
         [_episode("/library/metadata/1", ["/part/new"])],
     )
-    original_iter = cache._plex.iter_episodes
-    cache._plex.iter_episodes = lambda: _mutate_mid_iteration(cache, original_iter)
+    original_iter = cache._plex.iter_library_items
+    cache._plex.iter_library_items = lambda: _mutate_mid_iteration(cache, original_iter)
 
     cache.refresh_library_cache()
 
@@ -87,7 +87,7 @@ def _status_plex(calls, refresh_library_on_scan=True, last_refresh=None):
         last_refresh=last_refresh or datetime.fromtimestamp(0),
         refresh_library_cache=lambda: (calls.append("full"), [])[1],
     )
-    plex.get_recently_added_episode_refs = lambda minutes=5: (calls.append("cheap"), [])[1]
+    plex.get_recently_added_refs = lambda minutes=5: (calls.append("cheap"), [])[1]
     return plex
 
 
